@@ -1,0 +1,250 @@
+import torch
+from torch import nn
+import numpy as np
+import pandas as pd
+import os
+import argparse
+import joblib
+from tqdm import tqdm
+from dtaianomaly.evaluation import (
+    AreaUnderROC, AreaUnderPR,
+    VolumeUnderROC, VolumeUnderPR,
+    RangeBasedPrecision, RangeBasedRecall, RangeBasedFBeta,
+    AffiliationPrecision, AffiliationRecall, AffiliationFBeta
+)
+from sklearn.metrics import precision_recall_curve
+from data.preprocess import preprocess
+from data.dataset import SMDDataset
+from data.dataset import get_dataloaders
+from baselines.isolation_forest import Isolation_Forest
+from baselines.oc_svm import OC_SVM
+from baselines.lstm_ae import LSTMAutoencoder
+from baselines.patchtst import PatchTST
+
+def evaluate(anomaly_scores, labels, algo, window_size, sensor_dropout_rate):
+
+    labels = np.array(labels)
+    anomaly_scores = np.array(anomaly_scores)
+
+    roc_auc = AreaUnderROC().compute(labels, anomaly_scores)
+    pr_auc = AreaUnderPR().compute(labels, anomaly_scores)
+    
+    vus_roc = VolumeUnderROC().compute(labels, anomaly_scores)
+    vus_pr = VolumeUnderPR().compute(labels, anomaly_scores)
+
+    precisions, recalls, thresholds = precision_recall_curve(labels, anomaly_scores)
+    p_sliced = precisions[:-1]
+    r_sliced = recalls[:-1]
+    
+    f1_scores = (2 * p_sliced * r_sliced) / (p_sliced + r_sliced + 1e-10)
+    best_threshold = thresholds[np.argmax(f1_scores)]
+  
+    best_predictions = (anomaly_scores >= best_threshold).astype(int)
+
+    if np.sum(best_predictions) == 0:
+        aff_precision, aff_recall, aff_f1 = 0.0, 0.0, 0.0
+        rb_precision, rb_recall, rb_f1 = 0.0, 0.0, 0.0
+    else:
+        aff_precision = AffiliationPrecision().compute(labels, best_predictions)
+        aff_recall = AffiliationRecall().compute(labels, best_predictions)
+        aff_f1 = AffiliationFBeta().compute(labels, best_predictions)
+
+        rb_precision = RangeBasedPrecision().compute(labels, best_predictions)
+        rb_recall = RangeBasedRecall().compute(labels, best_predictions)
+        rb_f1 = RangeBasedFBeta().compute(labels, best_predictions)
+
+    results_dict = {
+        "ROC_AUC": roc_auc,
+        "PR_AUC": pr_auc,
+        "VUS_ROC": vus_roc,
+        "VUS_PR": vus_pr,
+        "Affiliation_Precision": aff_precision,
+        "Affiliation_Recall": aff_recall,
+        "Affiliation_F1": aff_f1,
+        "RangeBased_Precision": rb_precision,
+        "RangeBased_Recall": rb_recall,
+        "RangeBased_F1": rb_f1
+    }
+
+    print("\n" + "=" * 45)
+    print(f" {algo.upper()} EVALUATION SCORECARD FOR SENSOR DROPOUT RATE : {sensor_dropout_rate}")
+    print("=" * 45)
+    for metric, value in results_dict.items():
+        print(f"{metric.ljust(25)} : {value:.3f}")
+
+
+def apply_sensor_dropout(test_data, dropout_rate=0.0):
+
+    # Simulates physical sensor failure by zeroing out a percentage of the 38 SMD channels.
+
+    if dropout_rate == 0.0:
+        return test_data
+        
+    data_dropped = test_data.copy()
+    num_sensors = data_dropped.shape[1] # 38 for SMD
+    
+    # Calculate how many sensors to mathematically 'kill'
+    num_to_drop = int(num_sensors * dropout_rate)
+    
+    if num_to_drop > 0:
+        # Randomly select which sensors fail
+        sensors_to_drop = np.random.choice(num_sensors, num_to_drop, replace=False)
+        print(f"[*] SENSOR DROPOUT ACTIVE: Dropping {num_to_drop} sensors: {sensors_to_drop}")
+        
+        # Overwrite the selected sensor columns with 0.0 (the normalized mean)
+        data_dropped[:, sensors_to_drop] = 0.0
+        
+    return data_dropped
+
+
+def run_cross_machine_test(train_path, test_path, test_label_path, algo, window_size, sensor_dropout_rate):
+
+    print("Transformer-Based Anomaly Detection Using Time Series Foundation Models Baseline Cross Machine Test")
+
+    train_data, test_data, test_label_data = preprocess(train_path, test_path, test_label_path)
+
+    test_data = apply_sensor_dropout(test_data, sensor_dropout_rate)
+
+    test_labels = test_label_data[window_size - 1 :]
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if algo in ["isolation_forest", "oc_svm", "all"] :
+
+        test_dataset = SMDDataset(test_data, window_size, is_channel_independent=False)
+        X_test_3d = torch.stack([test_dataset[i] for i in range(len(test_dataset))]).numpy()
+        
+        # Flatten the 3D tensor to 2D for scikit-learn models to prevent the dimension crash
+        X_test = X_test_3d.reshape(X_test_3d.shape[0], -1)
+
+    if (algo == "isolation_forest" or algo =="all"):
+
+        print("Evaluating Isolation Forest Cross-Machine :")
+
+        model = joblib.load("./models/baseline_models/isolation_forest.joblib")
+        isolationforest_anomaly_scores = -model.score_samples(X_test)
+
+        evaluate(isolationforest_anomaly_scores, test_labels, "Isolation Forest", window_size, sensor_dropout_rate)
+
+    if (algo == "oc_svm" or algo =="all"):
+
+        print("Evaluating OneClass SVM Cross-Machine :")
+
+        model = joblib.load("./models/baseline_models/oc_svm.joblib")
+        ocsvm_anomaly_scores = -model.score_samples(X_test)
+
+        evaluate(ocsvm_anomaly_scores, test_labels, "OneClass SVM", window_size, sensor_dropout_rate)
+
+    if (algo == "lstm_ae" or algo =="all"):
+
+        print("Evaluating LSTM Autoencoder Cross-Machine :")
+
+        batch_size = 128
+        _, test_dataloader = get_dataloaders(train_data, test_data, window_size, num_workers=0, pin_memory=False, batch_size=batch_size, is_channel_independent=False)
+
+        hidden_dims = 64
+        latent_dim = 16
+
+        lstm_autoencoder = LSTMAutoencoder(
+            n_channels=38,
+            hidden_dims=hidden_dims,
+            latent_dim=latent_dim,
+            num_layers=2,
+            dropout=0.1
+        ).to(device)
+
+        lstm_autoencoder.load_state_dict(torch.load("./models/baseline_models/lstm_autoencoder.pth", weights_only=True))
+        lstm_autoencoder.eval()
+
+        lstmae_anomaly_scores = []
+
+        progress_bar = tqdm(total=len(test_dataloader), desc="LSTM Inference", unit="batch")
+
+        with torch.inference_mode():
+            for idx, batch in enumerate(test_dataloader):
+                batch = batch.to(device)
+                batch_scores = lstm_autoencoder.anomaly_score(batch)
+                lstmae_anomaly_scores.extend(batch_scores.cpu().numpy())
+                
+                if (idx + 1) % 100 == 0:
+                    progress_bar.update(100)
+            
+            progress_bar.update(len(test_dataloader) % 100)
+            progress_bar.close()
+
+        lstmae_anomaly_scores = np.array(lstmae_anomaly_scores)
+
+        evaluate(lstmae_anomaly_scores, test_labels, "LSTM Autoencoder", window_size, sensor_dropout_rate)
+
+    if (algo == "patchtst" or algo =="all"):
+
+        print("Evaluating PatchTST Cross-Machine :")
+
+        batch_size = 128
+        _, test_dataloader = get_dataloaders(train_data, test_data, window_size, num_workers=0, pin_memory=False, batch_size=batch_size, is_channel_independent=True)
+
+        patch_length = 10
+        stride = 10
+        d_model = 128
+        d_ff = 256
+        n_heads = 4
+        n_layers = 3
+
+        patchtst = PatchTST(
+            n_channels=38,
+            T=window_size,
+            patch_length=patch_length,
+            stride=stride,
+            d_model=d_model,
+            d_ff=d_ff,
+            n_heads=n_heads,
+            n_layers=n_layers
+        ).to(device)
+
+        patchtst.load_state_dict(torch.load("./models/baseline_models/patchtst.pth", weights_only=True))
+        patchtst.eval()
+
+        patchtst_anomaly_scores = []
+
+        progress_bar = tqdm(total=len(test_dataloader), desc="PatchTST Inference", unit="batch")
+
+        with torch.inference_mode():
+            for idx, batch in enumerate(test_dataloader):
+                batch = batch.to(device)
+                batch_scores = patchtst.anomaly_score(batch)
+                patchtst_anomaly_scores.extend(batch_scores.cpu().numpy())
+
+                if (idx + 1) % 100 == 0:
+                    progress_bar.update(100)
+            
+            progress_bar.update(len(test_dataloader) % 100)
+            progress_bar.close()
+
+        patchtst_anomaly_scores = np.array(patchtst_anomaly_scores)
+
+        evaluate(patchtst_anomaly_scores, test_labels, "PatchTST", window_size, sensor_dropout_rate)
+
+def main():
+
+    parser = argparse.ArgumentParser(description="Cross-Machine Baselines Evaluation")
+
+    parser.add_argument("--algo", type=str, choices=["isolation_forest", "oc_svm", "lstm_ae", "patchtst", "all"], default="all", help="Algorithm | Default runs all.")
+    parser.add_argument("--window_size", type=int, default=100, help="Sliding Window Size | Default is 100.")
+    parser.add_argument("--sensor_dropout_rate", type=float, default=0.0, help="Sensor Dropout Rate | Default is 0.0.")
+
+    args = parser.parse_args()
+
+    algo = args.algo
+    window_size = args.window_size
+    sensor_dropout_rate = args.sensor_dropout_rate
+
+    # ALL paths point to 1-3 to properly calibrate the target scaler
+    train_path = "./ServerMachineDataset/train/machine-1-3.txt"
+    test_path = "./ServerMachineDataset/test/machine-1-3.txt"
+    test_label_path = "./ServerMachineDataset/test_label/machine-1-3.txt"
+
+    run_cross_machine_test(train_path, test_path, test_label_path, algo, window_size, sensor_dropout_rate)
+
+if __name__=="__main__":
+
+    main()
